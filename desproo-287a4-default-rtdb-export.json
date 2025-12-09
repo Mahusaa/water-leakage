@@ -1,0 +1,17 @@
+{
+  "sensor1": {
+    "flow": "0.000 L/min",
+    "timestamp": 1762590697,
+    "total": "0.000 L"
+  },
+  "sensor2": {
+    "flow": "0.000 L/min",
+    "timestamp": 1762590698,
+    "total": "0.000 L"
+  },
+  "sensor3": {
+    "flow": "0.000 L/min",
+    "timestamp": 1762590698,
+    "total": "2.127 L"
+  }
+}
