@@ -30,5 +30,10 @@ const firebaseConfig = (() => {
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
+// Log Firebase connection info (database URL only, for debugging)
+if (typeof window !== "undefined") {
+  console.log("[Firebase] Connected to database:", firebaseConfig.databaseURL);
+}
+
 export const auth = getAuth(app);
 export const db = getDatabase(app);

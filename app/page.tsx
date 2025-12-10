@@ -354,9 +354,10 @@ export default function HomePage() {
     alerts: true,
     ecoMode: false,
   });
-  // Global r_value and threshold (fetched once)
+  // Global r_value and threshold (fetched from /system paths)
   const [globalRValue, setGlobalRValue] = useState<number | undefined>(undefined);
   const [globalThreshold, setGlobalThreshold] = useState<number | undefined>(undefined);
+  const [systemError, setSystemError] = useState<string | null>(null);
   // Chart data for each sensor (rolling window)
   const [chartData, setChartData] = useState<Record<string, ChartDataPoint[]>>({
     sensor1: [],
@@ -365,52 +366,85 @@ export default function HomePage() {
     sensor4: [],
   });
 
-  // Fetch global r_value and threshold from Firebase
+  // Fetch global r_value, threshold, and status from Firebase /system paths with realtime listeners
   useEffect(() => {
-    const tryPaths = ["global", "config", "settings", "/"];
     const unsubscribes: (() => void)[] = [];
 
-    const tryFetchFromPath = (path: string) => {
-      const globalRef = ref(db, path);
-
-      const unsubscribe = onValue(
-        globalRef,
-        (snapshot) => {
-          try {
-            const data = snapshot.val();
-            if (data && typeof data === "object") {
-              // Try to extract r_value and threshold from the data
-              const rValue = typeof data.r_value === "number" && Number.isFinite(data.r_value) ? data.r_value : 
-                           typeof data.rValue === "number" && Number.isFinite(data.rValue) ? data.rValue : undefined;
-              const threshold = typeof data.threshold === "number" && Number.isFinite(data.threshold) ? data.threshold : undefined;
-
-              if (rValue !== undefined) {
-                setGlobalRValue(rValue);
-                console.log(`Fetched global r_value from ${path}: ${rValue}`);
-              }
-              if (threshold !== undefined) {
-                setGlobalThreshold(threshold);
-                console.log(`Fetched global threshold from ${path}: ${threshold}`);
-              }
+    // Subscribe to /system/r_value
+    const rValueRef = ref(db, "system/r_value");
+    console.log("[Realtime] Subscribing to /system/r_value");
+    const unsubscribeRValue = onValue(
+      rValueRef,
+      (snapshot) => {
+        try {
+          const value = snapshot.val();
+          if (value !== null && value !== undefined) {
+            const numValue = typeof value === "number" ? value : parseFloat(value);
+            if (Number.isFinite(numValue)) {
+              setGlobalRValue(numValue);
+              setSystemError(null);
+              console.log(`[Realtime] Updated r_value: ${numValue}`);
+            } else {
+              console.warn(`[Realtime] Invalid r_value format: ${value}`);
             }
-          } catch (err) {
-            console.error(`Failed to parse global data from ${path}:`, err);
+          } else {
+            console.warn("[Realtime] /system/r_value is null or missing");
+            setSystemError("System r_value not available");
           }
-        },
-        (err) => {
-          // Silently fail for paths that don't exist
-          const error = err as Error & { code?: string };
-          if (error.code !== "PERMISSION_DENIED") {
-            console.error(`Firebase global subscription error for path ${path}:`, err);
-          }
+        } catch (err) {
+          console.error("[Realtime] Failed to parse r_value:", err);
+          setSystemError("Failed to parse r_value");
         }
-      );
+      },
+      (err) => {
+        const error = err as Error & { code?: string };
+        console.error("[Realtime] Error subscribing to /system/r_value:", error);
+        if (error.code === "PERMISSION_DENIED") {
+          setSystemError("Permission denied: /system/r_value");
+        } else {
+          setSystemError("Failed to connect to /system/r_value");
+        }
+      }
+    );
+    unsubscribes.push(unsubscribeRValue);
 
-      unsubscribes.push(unsubscribe);
-    };
-
-    // Try all paths in parallel
-    tryPaths.forEach(tryFetchFromPath);
+    // Subscribe to /system/threshold
+    const thresholdRef = ref(db, "system/threshold");
+    console.log("[Realtime] Subscribing to /system/threshold");
+    const unsubscribeThreshold = onValue(
+      thresholdRef,
+      (snapshot) => {
+        try {
+          const value = snapshot.val();
+          if (value !== null && value !== undefined) {
+            const numValue = typeof value === "number" ? value : parseFloat(value);
+            if (Number.isFinite(numValue)) {
+              setGlobalThreshold(numValue);
+              setSystemError(null);
+              console.log(`[Realtime] Updated threshold: ${numValue}`);
+            } else {
+              console.warn(`[Realtime] Invalid threshold format: ${value}`);
+            }
+          } else {
+            console.warn("[Realtime] /system/threshold is null or missing");
+            setSystemError("System threshold not available");
+          }
+        } catch (err) {
+          console.error("[Realtime] Failed to parse threshold:", err);
+          setSystemError("Failed to parse threshold");
+        }
+      },
+      (err) => {
+        const error = err as Error & { code?: string };
+        console.error("[Realtime] Error subscribing to /system/threshold:", error);
+        if (error.code === "PERMISSION_DENIED") {
+          setSystemError("Permission denied: /system/threshold");
+        } else {
+          setSystemError("Failed to connect to /system/threshold");
+        }
+      }
+    );
+    unsubscribes.push(unsubscribeThreshold);
 
     return () => {
       unsubscribes.forEach((unsub) => unsub());
@@ -944,6 +978,7 @@ export default function HomePage() {
     }
 
     const hasLeakage = leakageStatus.hasLeakage;
+    const hasSystemData = globalRValue !== undefined && globalThreshold !== undefined;
 
     return (
       <div className={`rounded-3xl border ${hasLeakage ? 'border-red-500/50' : 'border-slate-800'} bg-slate-900/70 p-5`}>
@@ -951,7 +986,11 @@ export default function HomePage() {
           Status
         </p>
         <div className="mt-3 space-y-2">
-          {hasLeakage ? (
+          {!hasSystemData ? (
+            <p className="text-sm text-yellow-400">
+              Waiting for system data...
+            </p>
+          ) : hasLeakage ? (
             <p className="text-lg font-semibold text-red-400">
               Leakage detected
             </p>
@@ -984,20 +1023,26 @@ export default function HomePage() {
             <p className="text-xs uppercase tracking-[0.3em] text-slate-500">
               Latest Update
             </p>
-            <div className="mt-3 space-y-3">
-              <div>
-                <p className="text-xs text-slate-400 mb-1">r_value</p>
-                <p className="text-lg font-semibold text-slate-50">
-                  {formatOptionalNumber(globalRValue)}
-                </p>
+            {systemError ? (
+              <div className="mt-3">
+                <p className="text-sm text-yellow-400">{systemError}</p>
               </div>
-              <div>
-                <p className="text-xs text-slate-400 mb-1">threshold</p>
-                <p className="text-lg font-semibold text-slate-50">
-                  {formatOptionalNumber(globalThreshold)}
-                </p>
+            ) : (
+              <div className="mt-3 space-y-3">
+                <div>
+                  <p className="text-xs text-slate-400 mb-1">r_value</p>
+                  <p className="text-lg font-semibold text-slate-50">
+                    {formatOptionalNumber(globalRValue)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-400 mb-1">threshold</p>
+                  <p className="text-lg font-semibold text-slate-50">
+                    {formatOptionalNumber(globalThreshold)}
+                  </p>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
         {sensorGrid}
