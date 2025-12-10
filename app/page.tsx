@@ -16,6 +16,8 @@ type SensorData = {
   flow: string;
   total: string;
   timestamp: number;
+  r_value?: number;
+  threshold?: number;
 };
 
 type Sensors = {
@@ -64,6 +66,15 @@ const normalizeSensors = (data: unknown): Sensors => {
     return {};
   }
 
+  const parseOptionalNumber = (value: unknown): number | undefined => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = parseFloat(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  };
+
   return Object.entries(data as Record<string, Partial<SensorData>>).reduce(
     (acc, [key, value]) => {
       if (
@@ -75,6 +86,8 @@ const normalizeSensors = (data: unknown): Sensors => {
           flow: value.flow,
           total: value.total,
           timestamp: value.timestamp,
+          r_value: parseOptionalNumber(value.r_value),
+          threshold: parseOptionalNumber(value.threshold),
         };
       } else {
         // Log missing/invalid sensor data for debugging
@@ -130,50 +143,30 @@ const parseMetric = (value: string) => {
   return Number.isFinite(numeric) ? numeric : 0;
 };
 
-// Leakage detection configuration
-// Threshold can be set via NEXT_PUBLIC_LEAK_THRESHOLD env var (in L/min)
-// Default: placeholder logic (currently returns false until threshold is calibrated)
-const getLeakThreshold = (): number => {
-  const envThreshold = process.env.NEXT_PUBLIC_LEAK_THRESHOLD;
-  if (envThreshold) {
-    const parsed = parseFloat(envThreshold);
-    if (Number.isFinite(parsed) && parsed >= 0) {
-      return parsed;
-    }
+const formatOptionalNumber = (value?: number) => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value.toFixed(3);
   }
-  // Placeholder: return a high value so no leaks detected until threshold is set
-  // TODO: Replace with actual calibrated threshold
-  return Infinity;
+  return "-";
 };
 
 /**
- * Detects if a sensor has a leakage issue.
- * Currently uses placeholder logic until threshold is calibrated.
+ * Detects if there is a leakage issue based on global r_value and threshold.
  * 
- * @param sensorData - Sensor data object with flow, total, timestamp
- * @returns true if leakage is detected, false otherwise
+ * @param globalRValue - Global r_value from Firebase
+ * @param globalThreshold - Global threshold from Firebase
+ * @returns true if leakage is detected (r_value > threshold), false otherwise
  */
-const isLeak = (sensorData: SensorData): boolean => {
-  if (!sensorData || !sensorData.flow) {
+const isLeakageDetected = (globalRValue?: number, globalThreshold?: number): boolean => {
+  if (globalRValue === undefined || globalThreshold === undefined) {
     return false;
   }
 
-  const threshold = getLeakThreshold();
-  const flowValue = parseMetric(sensorData.flow);
-
-  // Placeholder logic (to be replaced with actual calibration):
-  // For now, return false by default (no leaks detected)
-  // When threshold is set via env, check if flow exceeds threshold
-  if (threshold === Infinity) {
-    // No threshold set yet - placeholder returns false
+  if (!Number.isFinite(globalRValue) || !Number.isFinite(globalThreshold)) {
     return false;
   }
 
-  // Future: Actual leakage detection logic
-  // Example: return flowValue > threshold;
-  // Or: return flowValue < 0 || drop > X;
-  
-  return flowValue > threshold;
+  return globalRValue > globalThreshold;
 };
 
 const buildSparklinePath = (values: number[], width = 160, height = 60) => {
@@ -361,6 +354,9 @@ export default function HomePage() {
     alerts: true,
     ecoMode: false,
   });
+  // Global r_value and threshold (fetched once)
+  const [globalRValue, setGlobalRValue] = useState<number | undefined>(undefined);
+  const [globalThreshold, setGlobalThreshold] = useState<number | undefined>(undefined);
   // Chart data for each sensor (rolling window)
   const [chartData, setChartData] = useState<Record<string, ChartDataPoint[]>>({
     sensor1: [],
@@ -368,6 +364,58 @@ export default function HomePage() {
     sensor3: [],
     sensor4: [],
   });
+
+  // Fetch global r_value and threshold from Firebase
+  useEffect(() => {
+    const tryPaths = ["global", "config", "settings", "/"];
+    const unsubscribes: (() => void)[] = [];
+
+    const tryFetchFromPath = (path: string) => {
+      const globalRef = ref(db, path);
+
+      const unsubscribe = onValue(
+        globalRef,
+        (snapshot) => {
+          try {
+            const data = snapshot.val();
+            if (data && typeof data === "object") {
+              // Try to extract r_value and threshold from the data
+              const rValue = typeof data.r_value === "number" && Number.isFinite(data.r_value) ? data.r_value : 
+                           typeof data.rValue === "number" && Number.isFinite(data.rValue) ? data.rValue : undefined;
+              const threshold = typeof data.threshold === "number" && Number.isFinite(data.threshold) ? data.threshold : undefined;
+
+              if (rValue !== undefined) {
+                setGlobalRValue(rValue);
+                console.log(`Fetched global r_value from ${path}: ${rValue}`);
+              }
+              if (threshold !== undefined) {
+                setGlobalThreshold(threshold);
+                console.log(`Fetched global threshold from ${path}: ${threshold}`);
+              }
+            }
+          } catch (err) {
+            console.error(`Failed to parse global data from ${path}:`, err);
+          }
+        },
+        (err) => {
+          // Silently fail for paths that don't exist
+          const error = err as Error & { code?: string };
+          if (error.code !== "PERMISSION_DENIED") {
+            console.error(`Firebase global subscription error for path ${path}:`, err);
+          }
+        }
+      );
+
+      unsubscribes.push(unsubscribe);
+    };
+
+    // Try all paths in parallel
+    tryPaths.forEach(tryFetchFromPath);
+
+    return () => {
+      unsubscribes.forEach((unsub) => unsub());
+    };
+  }, []);
 
   // Real-time sensor data from sensorsCurrent/ (with fallback to root /)
   useEffect(() => {
@@ -594,34 +642,13 @@ export default function HomePage() {
   }, [history, historyFilter]);
 
   const leakageStatus = useMemo(() => {
-    if (!sensorEntries.length) {
-      return {
-        sensorsWithLeaks: [] as string[],
-        hasLeaks: false,
-        message: "Data belum tersedia",
-      };
-    }
-
-    const sensorsWithLeaks = sensorEntries
-      .filter(([, sensor]) => {
-        try {
-          return isLeak(sensor);
-        } catch (err) {
-          console.warn("Error checking leakage for sensor:", err);
-          return false;
-        }
-      })
-      .map(([key]) => key);
-
+    const hasLeakage = isLeakageDetected(globalRValue, globalThreshold);
+    
     return {
-      sensorsWithLeaks,
-      hasLeaks: sensorsWithLeaks.length > 0,
-      message:
-        sensorsWithLeaks.length === 0
-          ? "Tidak ada kebocoran terdeteksi"
-          : undefined,
+      hasLeakage,
+      message: hasLeakage ? "Leakage detected" : "Tidak ada kebocoran terdeteksi",
     };
-  }, [sensorEntries]);
+  }, [globalRValue, globalThreshold]);
 
   const summary = useMemo(() => {
     if (!sensorEntries.length) {
@@ -689,7 +716,7 @@ export default function HomePage() {
                   {sensor.flow}
                 </dd>
               </div>
-              <div className="flex items-baseline justify-between">
+              <div className="flex items-baseline justify-between sm:block">
                 <dt className="text-slate-400">Total volume</dt>
                 <dd className="text-xl font-semibold text-slate-100">
                   {sensor.total}
@@ -716,12 +743,6 @@ export default function HomePage() {
               )}
             </div>
 
-            <div className="mt-6 flex items-center justify-between text-xs text-slate-500">
-              <span>Last updated</span>
-              <span className="text-slate-300">
-                {formatTimestamp(sensor.timestamp)}
-              </span>
-            </div>
           </article>
         );
       })}
@@ -922,21 +943,18 @@ export default function HomePage() {
       );
     }
 
+    const hasLeakage = leakageStatus.hasLeakage;
+
     return (
-      <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
+      <div className={`rounded-3xl border ${hasLeakage ? 'border-red-500/50' : 'border-slate-800'} bg-slate-900/70 p-5`}>
         <p className="text-xs uppercase tracking-[0.3em] text-slate-500">
           Status
         </p>
         <div className="mt-3 space-y-2">
-          {leakageStatus.hasLeaks ? (
-            leakageStatus.sensorsWithLeaks.map((sensorId) => (
-              <div
-                key={sensorId}
-                className="text-lg font-semibold text-red-400"
-              >
-                {sensorId} ada issue kebocoran
-              </div>
-            ))
+          {hasLeakage ? (
+            <p className="text-lg font-semibold text-red-400">
+              Leakage detected
+            </p>
           ) : (
             <p className="text-lg font-semibold text-emerald-400">
               {leakageStatus.message}
@@ -966,9 +984,20 @@ export default function HomePage() {
             <p className="text-xs uppercase tracking-[0.3em] text-slate-500">
               Latest Update
             </p>
-            <p className="mt-2 text-lg font-semibold text-slate-200">
-              {summary.latestUpdate}
-            </p>
+            <div className="mt-3 space-y-3">
+              <div>
+                <p className="text-xs text-slate-400 mb-1">r_value</p>
+                <p className="text-lg font-semibold text-slate-50">
+                  {formatOptionalNumber(globalRValue)}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">threshold</p>
+                <p className="text-lg font-semibold text-slate-50">
+                  {formatOptionalNumber(globalThreshold)}
+                </p>
+              </div>
+            </div>
           </div>
         </div>
         {sensorGrid}
